@@ -17,6 +17,39 @@
 
 package org.apache.rocketmq.client.java.impl;
 
+import com.google.common.util.concurrent.ListenableFuture;
+
+import org.apache.rocketmq.client.apis.ClientException;
+import org.apache.rocketmq.client.java.exception.InternalErrorException;
+import org.apache.rocketmq.client.java.misc.ClientId;
+import org.apache.rocketmq.client.java.misc.ExecutorServices;
+import org.apache.rocketmq.client.java.misc.MetadataUtils;
+import org.apache.rocketmq.client.java.misc.ThreadFactoryImpl;
+import org.apache.rocketmq.client.java.misc.Utilities;
+import org.apache.rocketmq.client.java.route.Endpoints;
+import org.apache.rocketmq.client.java.rpc.Context;
+import org.apache.rocketmq.client.java.rpc.RpcClient;
+import org.apache.rocketmq.client.java.rpc.RpcClientImpl;
+import org.apache.rocketmq.client.java.rpc.RpcFuture;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.SSLException;
+
 import apache.rocketmq.v2.AckMessageRequest;
 import apache.rocketmq.v2.AckMessageResponse;
 import apache.rocketmq.v2.ChangeInvisibleDurationRequest;
@@ -38,39 +71,8 @@ import apache.rocketmq.v2.ReceiveMessageResponse;
 import apache.rocketmq.v2.SendMessageRequest;
 import apache.rocketmq.v2.SendMessageResponse;
 import apache.rocketmq.v2.TelemetryCommand;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.errorprone.annotations.concurrent.GuardedBy;
 import io.grpc.Metadata;
 import io.grpc.stub.StreamObserver;
-import java.io.IOException;
-import java.time.Duration;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-import javax.net.ssl.SSLException;
-import org.apache.rocketmq.client.apis.ClientException;
-import org.apache.rocketmq.client.java.exception.InternalErrorException;
-import org.apache.rocketmq.client.java.misc.ClientId;
-import org.apache.rocketmq.client.java.misc.ExecutorServices;
-import org.apache.rocketmq.client.java.misc.MetadataUtils;
-import org.apache.rocketmq.client.java.misc.ThreadFactoryImpl;
-import org.apache.rocketmq.client.java.misc.Utilities;
-import org.apache.rocketmq.client.java.route.Endpoints;
-import org.apache.rocketmq.client.java.rpc.Context;
-import org.apache.rocketmq.client.java.rpc.RpcClient;
-import org.apache.rocketmq.client.java.rpc.RpcClientImpl;
-import org.apache.rocketmq.client.java.rpc.RpcFuture;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 /**
  * @see ClientManager
@@ -94,9 +96,7 @@ public class ClientManagerImpl extends ClientManager {
 
     private final Client client;
 
-    @GuardedBy("rpcClientTableLock")
     private final Map<Endpoints, RpcClient> rpcClientTable;
-    private final ReadWriteLock rpcClientTableLock;
 
     /**
      * In charge of all scheduled tasks.
@@ -108,77 +108,84 @@ public class ClientManagerImpl extends ClientManager {
      */
     private final ExecutorService asyncWorker;
 
+    private BlockingQueue<RpcClientWrap> idleClients;
+
     public ClientManagerImpl(Client client) {
         this.client = client;
-        this.rpcClientTable = new HashMap<>();
-        this.rpcClientTableLock = new ReentrantReadWriteLock();
+        this.rpcClientTable = new ConcurrentHashMap<>();
         final long clientIndex = client.getClientId().getIndex();
+        this.idleClients = new LinkedBlockingQueue<>();
         this.scheduler = new ScheduledThreadPoolExecutor(
-            Runtime.getRuntime().availableProcessors(),
-            new ThreadFactoryImpl("ClientScheduler", clientIndex));
+                Runtime.getRuntime().availableProcessors(),
+                new ThreadFactoryImpl("ClientScheduler", clientIndex));
 
         this.asyncWorker = new ThreadPoolExecutor(
-            Runtime.getRuntime().availableProcessors(),
-            Runtime.getRuntime().availableProcessors(),
-            60,
-            TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(50000),
-            new ThreadFactoryImpl("ClientAsyncWorker", clientIndex));
+                Runtime.getRuntime().availableProcessors(),
+                Runtime.getRuntime().availableProcessors(),
+                60,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(50000),
+                new ThreadFactoryImpl("ClientAsyncWorker", clientIndex));
+
     }
 
     /**
-     * It is well-founded that a {@link RpcClient} is deprecated if it is idle for a long time, so it is essential to
-     * clear it.
+     * It is well-founded that a {@link RpcClient} is deprecated if it is idle for a long time, so
+     * it is essential to clear it.
      *
      * @throws InterruptedException if the thread has been interrupted
      */
     private void clearIdleRpcClients() throws InterruptedException {
-        rpcClientTableLock.writeLock().lock();
-        try {
-            final Iterator<Map.Entry<Endpoints, RpcClient>> it = rpcClientTable.entrySet().iterator();
-            while (it.hasNext()) {
-                final Map.Entry<Endpoints, RpcClient> entry = it.next();
-                final Endpoints endpoints = entry.getKey();
-                final RpcClient rpcClient = entry.getValue();
+        final Iterator<Map.Entry<Endpoints, RpcClient>> it = rpcClientTable.entrySet().iterator();
+        while (it.hasNext()) {
+            final Map.Entry<Endpoints, RpcClient> entry = it.next();
+            final Endpoints endpoints = entry.getKey();
+            final RpcClient rpcClient = entry.getValue();
 
-                final Duration idleDuration = rpcClient.idleDuration();
-                if (idleDuration.compareTo(RPC_CLIENT_MAX_IDLE_DURATION) > 0) {
-                    it.remove();
-                    rpcClient.shutdown();
-                    log.info("Rpc client has been idle for a long time, endpoints={}, idleDuration={}, " +
-                            "rpcClientMaxIdleDuration={}, clientId={}", endpoints, idleDuration,
-                        RPC_CLIENT_MAX_IDLE_DURATION, client.getClientId());
-                }
+            final Duration idleDuration = rpcClient.idleDuration();
+            if (idleDuration.compareTo(RPC_CLIENT_MAX_IDLE_DURATION) > 0) {
+                it.remove();
+                idleClients.put(new RpcClientWrap(endpoints, rpcClient));
             }
-        } finally {
-            rpcClientTableLock.writeLock().unlock();
+        }
+    }
+
+    private void shutdownIdleRpcClients() throws InterruptedException {
+        while (true) {
+            RpcClientWrap rpcClientWrap = idleClients.poll(10, TimeUnit.SECONDS);
+            if (null == rpcClientWrap) {
+                // wait for next poll
+                return;
+            }
+            final Endpoints endpoints = rpcClientWrap.endpoints;
+            final RpcClient rpcClient = rpcClientWrap.rpcClient;
+
+            rpcClient.shutdown();
+            log.info("Rpc client has been idle for a long time, endpoints={}, idleDuration={}, " +
+                            "rpcClientMaxIdleDuration={}, clientId={}", endpoints, rpcClient.idleDuration(),
+                    RPC_CLIENT_MAX_IDLE_DURATION, client.getClientId());
         }
     }
 
     /**
-     * Obtain the RPC client by remote {@link Endpoints}, if it does not already exist, it will be created
-     * automatically.
+     * Obtain the RPC client by remote {@link Endpoints}, if it does not already exist, it will be
+     * created automatically.
      *
      * @param endpoints remote endpoints.
      * @return RPC client.
      */
     private RpcClient getRpcClient(Endpoints endpoints) throws ClientException {
         RpcClient rpcClient;
-        rpcClientTableLock.readLock().lock();
-        try {
-            rpcClient = rpcClientTable.get(endpoints);
-            if (null != rpcClient) {
-                return rpcClient;
-            }
-        } finally {
-            rpcClientTableLock.readLock().unlock();
+        rpcClient = rpcClientTable.get(endpoints);
+        if (null != rpcClient) {
+            return rpcClient;
         }
-        rpcClientTableLock.writeLock().lock();
-        try {
-            rpcClient = rpcClientTable.get(endpoints);
-            if (null != rpcClient) {
-                return rpcClient;
-            }
+        rpcClient = rpcClientTable.get(endpoints);
+        if (null != rpcClient) {
+            return rpcClient;
+        }
+        // 并发控制
+        synchronized (endpoints) {
             try {
                 rpcClient = new RpcClientImpl(endpoints, client.isSslEnabled());
             } catch (SSLException e) {
@@ -187,20 +194,19 @@ public class ClientManagerImpl extends ClientManager {
             }
             rpcClientTable.put(endpoints, rpcClient);
             return rpcClient;
-        } finally {
-            rpcClientTableLock.writeLock().unlock();
         }
     }
 
     @Override
-    public RpcFuture<QueryRouteRequest, QueryRouteResponse> queryRoute(Endpoints endpoints, QueryRouteRequest request,
-        Duration duration) {
+    public RpcFuture<QueryRouteRequest, QueryRouteResponse> queryRoute(Endpoints
+                                                                               endpoints, QueryRouteRequest request,
+                                                                       Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<QueryRouteResponse> future = rpcClient.queryRoute(metadata, request, asyncWorker,
-                duration);
+                    duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -208,8 +214,9 @@ public class ClientManagerImpl extends ClientManager {
     }
 
     @Override
-    public RpcFuture<HeartbeatRequest, HeartbeatResponse> heartbeat(Endpoints endpoints, HeartbeatRequest request,
-        Duration duration) {
+    public RpcFuture<HeartbeatRequest, HeartbeatResponse> heartbeat(Endpoints
+                                                                            endpoints, HeartbeatRequest request,
+                                                                    Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
@@ -223,13 +230,13 @@ public class ClientManagerImpl extends ClientManager {
 
     @Override
     public RpcFuture<SendMessageRequest, SendMessageResponse> sendMessage(Endpoints endpoints,
-        SendMessageRequest request, Duration duration) {
+                                                                          SendMessageRequest request, Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<SendMessageResponse> future =
-                rpcClient.sendMessage(metadata, request, asyncWorker, duration);
+                    rpcClient.sendMessage(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -237,14 +244,15 @@ public class ClientManagerImpl extends ClientManager {
     }
 
     @Override
-    public RpcFuture<QueryAssignmentRequest, QueryAssignmentResponse> queryAssignment(Endpoints endpoints,
-        QueryAssignmentRequest request, Duration duration) {
+    public RpcFuture<QueryAssignmentRequest, QueryAssignmentResponse> queryAssignment(Endpoints
+                                                                                              endpoints,
+                                                                                      QueryAssignmentRequest request, Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<QueryAssignmentResponse> future =
-                rpcClient.queryAssignment(metadata, request, asyncWorker, duration);
+                    rpcClient.queryAssignment(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -252,14 +260,15 @@ public class ClientManagerImpl extends ClientManager {
     }
 
     @Override
-    public RpcFuture<ReceiveMessageRequest, List<ReceiveMessageResponse>> receiveMessage(Endpoints endpoints,
-        ReceiveMessageRequest request, Duration duration) {
+    public RpcFuture<ReceiveMessageRequest, List<ReceiveMessageResponse>> receiveMessage
+            (Endpoints endpoints,
+             ReceiveMessageRequest request, Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<List<ReceiveMessageResponse>> future =
-                rpcClient.receiveMessage(metadata, request, asyncWorker, duration);
+                    rpcClient.receiveMessage(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -267,14 +276,15 @@ public class ClientManagerImpl extends ClientManager {
     }
 
     @Override
-    public RpcFuture<AckMessageRequest, AckMessageResponse> ackMessage(Endpoints endpoints, AckMessageRequest request,
-        Duration duration) {
+    public RpcFuture<AckMessageRequest, AckMessageResponse> ackMessage(Endpoints
+                                                                               endpoints, AckMessageRequest request,
+                                                                       Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<AckMessageResponse> future =
-                rpcClient.ackMessage(metadata, request, asyncWorker, duration);
+                    rpcClient.ackMessage(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -284,13 +294,13 @@ public class ClientManagerImpl extends ClientManager {
     @Override
     public RpcFuture<ChangeInvisibleDurationRequest, ChangeInvisibleDurationResponse>
     changeInvisibleDuration(Endpoints endpoints, ChangeInvisibleDurationRequest request,
-        Duration duration) {
+                            Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<ChangeInvisibleDurationResponse> future =
-                rpcClient.changeInvisibleDuration(metadata, request, asyncWorker, duration);
+                    rpcClient.changeInvisibleDuration(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -300,13 +310,13 @@ public class ClientManagerImpl extends ClientManager {
     @Override
     public RpcFuture<ForwardMessageToDeadLetterQueueRequest, ForwardMessageToDeadLetterQueueResponse>
     forwardMessageToDeadLetterQueue(Endpoints endpoints, ForwardMessageToDeadLetterQueueRequest request,
-        Duration duration) {
+                                    Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<ForwardMessageToDeadLetterQueueResponse> future =
-                rpcClient.forwardMessageToDeadLetterQueue(metadata, request, asyncWorker, duration);
+                    rpcClient.forwardMessageToDeadLetterQueue(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -314,14 +324,15 @@ public class ClientManagerImpl extends ClientManager {
     }
 
     @Override
-    public RpcFuture<EndTransactionRequest, EndTransactionResponse> endTransaction(Endpoints endpoints,
-        EndTransactionRequest request, Duration duration) {
+    public RpcFuture<EndTransactionRequest, EndTransactionResponse> endTransaction(Endpoints
+                                                                                           endpoints,
+                                                                                   EndTransactionRequest request, Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<EndTransactionResponse> future =
-                rpcClient.endTransaction(metadata, request, asyncWorker, duration);
+                    rpcClient.endTransaction(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -331,13 +342,13 @@ public class ClientManagerImpl extends ClientManager {
     @Override
     public RpcFuture<NotifyClientTerminationRequest, NotifyClientTerminationResponse>
     notifyClientTermination(Endpoints endpoints, NotifyClientTerminationRequest request,
-        Duration duration) {
+                            Duration duration) {
         try {
             final Metadata metadata = client.sign();
             final Context context = new Context(endpoints, metadata);
             final RpcClient rpcClient = getRpcClient(endpoints);
             final ListenableFuture<NotifyClientTerminationResponse> future =
-                rpcClient.notifyClientTermination(metadata, request, asyncWorker, duration);
+                    rpcClient.notifyClientTermination(metadata, request, asyncWorker, duration);
             return new RpcFuture<>(context, request, future);
         } catch (Throwable t) {
             return new RpcFuture<>(t);
@@ -346,7 +357,7 @@ public class ClientManagerImpl extends ClientManager {
 
     @Override
     public StreamObserver<TelemetryCommand> telemetry(Endpoints endpoints, Duration duration,
-        StreamObserver<TelemetryCommand> responseObserver) throws ClientException {
+                                                      StreamObserver<TelemetryCommand> responseObserver) throws ClientException {
         try {
             final Metadata metadata = client.sign();
             final RpcClient rpcClient = getRpcClient(endpoints);
@@ -366,59 +377,71 @@ public class ClientManagerImpl extends ClientManager {
         final ClientId clientId = client.getClientId();
         log.info("Begin to start the client manager, clientId={}", clientId);
         scheduler.scheduleWithFixedDelay(
-            () -> {
-                try {
-                    clearIdleRpcClients();
-                } catch (Throwable t) {
-                    log.error("Exception raised during the clearing of idle rpc clients, clientId={}", clientId, t);
-                }
-            },
-            RPC_CLIENT_IDLE_CHECK_INITIAL_DELAY.toNanos(),
-            RPC_CLIENT_IDLE_CHECK_PERIOD.toNanos(),
-            TimeUnit.NANOSECONDS
+                () -> {
+                    try {
+                        clearIdleRpcClients();
+                    } catch (Throwable t) {
+                        log.error("Exception raised during the clearing of idle rpc clients, clientId={}", clientId, t);
+                    }
+                },
+                RPC_CLIENT_IDLE_CHECK_INITIAL_DELAY.toNanos(),
+                RPC_CLIENT_IDLE_CHECK_PERIOD.toNanos(),
+                TimeUnit.NANOSECONDS
+        );
+        scheduler.scheduleWithFixedDelay(
+                () -> {
+                    try {
+                        shutdownIdleRpcClients();
+                    } catch (Throwable t) {
+                        log.error("Exception raised during the shutdown of idle rpc clients, clientId={}", clientId, t);
+                    }
+                },
+                RPC_CLIENT_IDLE_CHECK_INITIAL_DELAY.toNanos(),
+                RPC_CLIENT_IDLE_CHECK_PERIOD.toNanos(),
+                TimeUnit.NANOSECONDS
         );
 
         scheduler.scheduleWithFixedDelay(
-            () -> {
-                try {
-                    client.doHeartbeat();
-                } catch (Throwable t) {
-                    log.error("Exception raised during heartbeat, clientId={}", clientId, t);
-                }
-            },
-            HEART_BEAT_INITIAL_DELAY.toNanos(),
-            HEART_BEAT_PERIOD.toNanos(),
-            TimeUnit.NANOSECONDS
+                () -> {
+                    try {
+                        client.doHeartbeat();
+                    } catch (Throwable t) {
+                        log.error("Exception raised during heartbeat, clientId={}", clientId, t);
+                    }
+                },
+                HEART_BEAT_INITIAL_DELAY.toNanos(),
+                HEART_BEAT_PERIOD.toNanos(),
+                TimeUnit.NANOSECONDS
         );
 
         scheduler.scheduleWithFixedDelay(
-            () -> {
-                try {
-                    log.info("Start to log statistics, clientVersion={}, clientWrapperVersion={}, "
-                            + "clientEndpoints={}, os description=[{}], java description=[{}], clientId={}",
-                        MetadataUtils.getVersion(), MetadataUtils.getWrapperVersion(), client.getEndpoints(),
-                        Utilities.getOsDescription(), Utilities.getJavaDescription(), clientId);
-                    client.doStats();
-                } catch (Throwable t) {
-                    log.error("Exception raised during statistics logging, clientId={}", clientId, t);
-                }
-            },
-            LOG_STATS_INITIAL_DELAY.toNanos(),
-            LOG_STATS_PERIOD.toNanos(),
-            TimeUnit.NANOSECONDS
+                () -> {
+                    try {
+                        log.info("Start to log statistics, clientVersion={}, clientWrapperVersion={}, "
+                                        + "clientEndpoints={}, os description=[{}], java description=[{}], clientId={}",
+                                MetadataUtils.getVersion(), MetadataUtils.getWrapperVersion(), client.getEndpoints(),
+                                Utilities.getOsDescription(), Utilities.getJavaDescription(), clientId);
+                        client.doStats();
+                    } catch (Throwable t) {
+                        log.error("Exception raised during statistics logging, clientId={}", clientId, t);
+                    }
+                },
+                LOG_STATS_INITIAL_DELAY.toNanos(),
+                LOG_STATS_PERIOD.toNanos(),
+                TimeUnit.NANOSECONDS
         );
 
         scheduler.scheduleWithFixedDelay(
-            () -> {
-                try {
-                    client.syncSettings();
-                } catch (Throwable t) {
-                    log.error("Exception raised during the setting synchronization, clientId={}", clientId, t);
-                }
-            },
-            SYNC_SETTINGS_DELAY.toNanos(),
-            SYNC_SETTINGS_PERIOD.toNanos(),
-            TimeUnit.NANOSECONDS
+                () -> {
+                    try {
+                        client.syncSettings();
+                    } catch (Throwable t) {
+                        log.error("Exception raised during the setting synchronization, clientId={}", clientId, t);
+                    }
+                },
+                SYNC_SETTINGS_DELAY.toNanos(),
+                SYNC_SETTINGS_PERIOD.toNanos(),
+                TimeUnit.NANOSECONDS
         );
         log.info("The client manager starts successfully, clientId={}", clientId);
     }
@@ -434,17 +457,12 @@ public class ClientManagerImpl extends ClientManager {
             } else {
                 log.info("Shutdown the client scheduler successfully, clientId={}", clientId);
             }
-            rpcClientTableLock.writeLock().lock();
-            try {
-                final Iterator<Map.Entry<Endpoints, RpcClient>> it = rpcClientTable.entrySet().iterator();
-                while (it.hasNext()) {
-                    final Map.Entry<Endpoints, RpcClient> entry = it.next();
-                    final RpcClient rpcClient = entry.getValue();
-                    it.remove();
-                    rpcClient.shutdown();
-                }
-            } finally {
-                rpcClientTableLock.writeLock().unlock();
+            final Iterator<Map.Entry<Endpoints, RpcClient>> it = rpcClientTable.entrySet().iterator();
+            while (it.hasNext()) {
+                final Map.Entry<Endpoints, RpcClient> entry = it.next();
+                final RpcClient rpcClient = entry.getValue();
+                it.remove();
+                rpcClient.shutdown();
             }
             log.info("Shutdown all rpc client(s) successfully, clientId={}", clientId);
             asyncWorker.shutdown();
@@ -464,5 +482,15 @@ public class ClientManagerImpl extends ClientManager {
     @Override
     protected String serviceName() {
         return super.serviceName() + "-" + client.getClientId().getIndex();
+    }
+
+    private static class RpcClientWrap {
+        Endpoints endpoints;
+        RpcClient rpcClient;
+
+        public RpcClientWrap(Endpoints endpoints, RpcClient rpcClient) {
+            this.endpoints = endpoints;
+            this.rpcClient = rpcClient;
+        }
     }
 }
